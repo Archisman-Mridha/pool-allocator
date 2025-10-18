@@ -36,7 +36,7 @@ pub fn build(b: *std.Build) void {
 
             // TODO : Enable thread-sanitizer.
             //        Currently, having some problems in MacOS (M2 chip).
-            .sanitize_thread = false,
+            // .sanitize_thread = true,
 
             .link_libc = true,
         }),
