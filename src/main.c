@@ -8,25 +8,24 @@
 #define MAX_OBJECT_COUNT 16
 
 struct Pool {
-  void* memory;
+  void*  memory;
   size_t objectSize;
 
-  int allocatableObjectsStack[MAX_OBJECT_COUNT];
-  int allocatableObjectsStackPointer;
+  int allocatableSlotsStack[MAX_OBJECT_COUNT];
+  int allocatableSlotsStackPointer;
 
   pthread_mutex_t mutexLock;
 };
 
 static void init(struct Pool* pool, size_t objectSize) {
-  pool->objectSize = objectSize;
-
-  // Initialize the pool memory.
   pool->memory = malloc(MAX_OBJECT_COUNT * objectSize);
 
-  for (int i = 0; i < MAX_OBJECT_COUNT; i++)
-    pool->allocatableObjectsStack[i] = i;
+  pool->objectSize = objectSize;
 
-  pool->allocatableObjectsStackPointer = MAX_OBJECT_COUNT - 1;
+  for (int i = 0; i < MAX_OBJECT_COUNT; i++)
+    pool->allocatableSlotsStack[i] = i;
+
+  pool->allocatableSlotsStackPointer = MAX_OBJECT_COUNT - 1;
 
   pthread_mutex_init(&pool->mutexLock, NULL);
 }
@@ -34,23 +33,21 @@ static void init(struct Pool* pool, size_t objectSize) {
 static void* allocate(struct Pool* pool) {
   pthread_mutex_lock(&pool->mutexLock);
 
-  void* allocatableObject = NULL;
+  void* allocatableSlot = NULL;
 
-  // CASE : Allocatable Object is available.
-  if (pool->allocatableObjectsStackPointer >= 0) {
-    int allocatableObjectIndex =
-        pool->allocatableObjectsStack[pool->allocatableObjectsStackPointer];
+  // Allocatable slot is available.
+  if (pool->allocatableSlotsStackPointer >= 0) {
+    int allocatableSlotIndex = pool->allocatableSlotsStack[pool->allocatableSlotsStackPointer];
 
-    allocatableObject =
-        (char*)pool->memory + (allocatableObjectIndex * pool->objectSize);
+    allocatableSlot = (char*)pool->memory + (allocatableSlotIndex * pool->objectSize);
 
-    // Shift `allocatableObjectIndexPointer` to the left.
-    --pool->allocatableObjectsStackPointer;
+    // Shift allocatableSlots stack pointer to the left.
+    --pool->allocatableSlotsStackPointer;
   }
 
   pthread_mutex_unlock(&pool->mutexLock);
 
-  return allocatableObject;
+  return allocatableSlot;
 }
 
 static void deallocate(struct Pool* pool, void* entity) {
@@ -59,9 +56,9 @@ static void deallocate(struct Pool* pool, void* entity) {
   // Calculate the index of the given Entity object, in the entities array.
   int i = ((ptrdiff_t)entity - (ptrdiff_t)pool->memory) / pool->objectSize;
 
-  // Shift `allocatableObjectIndexPointer` to the right.
-  ++pool->allocatableObjectsStackPointer;
-  pool->allocatableObjectsStack[pool->allocatableObjectsStackPointer] = i;
+  // Shift allocatableSlot stack pointer to the right.
+  ++pool->allocatableSlotsStackPointer;
+  pool->allocatableSlotsStack[pool->allocatableSlotsStackPointer] = i;
 
   pthread_mutex_unlock(&pool->mutexLock);
 }
@@ -70,7 +67,7 @@ struct Entity {
   int health;
 };
 
-void test_singleThreaded() {
+void test_singleThreaded( ) {
   struct Pool memoryPool;
   init(&memoryPool, sizeof(struct Entity));
 
@@ -87,8 +84,7 @@ void test_singleThreaded() {
     deallocate(&memoryPool, allocatedEntities[i]);
 
   for (int i = 0; i < MAX_OBJECT_COUNT; i++)
-    assert(memoryPool.allocatableObjectsStack[i] ==
-           (MAX_OBJECT_COUNT - (i + 1)));
+    assert(memoryPool.allocatableSlotsStack[i] == (MAX_OBJECT_COUNT - (i + 1)));
 }
 
 static void* threadWorker(void* args) {
@@ -99,7 +95,7 @@ static void* threadWorker(void* args) {
   return NULL;
 }
 
-void test_multiThreaded() {
+void test_multiThreaded( ) {
   struct Pool memoryPool;
   init(&memoryPool, sizeof(struct Entity));
 
@@ -113,11 +109,12 @@ void test_multiThreaded() {
   for (int i = 0; i < THREAD_COUNT; i++)
     pthread_create(&threads[i], NULL, threadWorker, &memoryPool);
 
-  for (int i = 0; i < THREAD_COUNT; i++) pthread_join(threads[i], NULL);
+  for (int i = 0; i < THREAD_COUNT; i++)
+    pthread_join(threads[i], NULL);
 }
 
 int main(void) {
-  test_singleThreaded();
+  test_singleThreaded( );
 
-  test_multiThreaded();
+  test_multiThreaded( );
 }

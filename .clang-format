@@ -1,1 +1,24 @@
-{ BasedOnStyle: Google }
+{
+  BasedOnStyle: Google,
+
+  ColumnLimit: 100,
+  ReflowComments: Never,
+
+  NamespaceIndentation: All,
+  # IndentAccessModifiers: true,
+
+  AlignConsecutiveDeclarations: Consecutive,
+  AlignConsecutiveAssignments: Consecutive,
+  AlignAfterOpenBracket: Align,
+  AlignTrailingComments: true,
+
+  AllowShortIfStatementsOnASingleLine: Never,
+  AllowShortLoopsOnASingleLine: false,
+
+  SpaceInEmptyParentheses: true,
+  SpaceInEmptyBlock: true,
+
+  BreakInheritanceList: BeforeColon,
+
+  FixNamespaceComments: false,
+}
