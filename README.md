@@ -1,14 +1,5 @@
 # Pool Allocator from scratch (in C)
 
-## TODOs
-
-- [x] Single threaded implementation.
-- [x] Multi threaded implementation (using MUTEX locks).
-- [x] Make the Pool Allocator generic.
-- [ ] Allow the Pool Allocator's memory to grow in batches.
-
-- [ ] Understand the motivation behind `ptrdiff_t`.
-
 ## REFERENCEs
 
 - [Pool Allocator in C](https://www.youtube.com/playlist?list=PL56QX8UwEVcm5ueUSZrcyuue9d0gUAqyJ)
