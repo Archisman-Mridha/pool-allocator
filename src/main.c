@@ -8,8 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MAX_BATCH_COUNT 5
-#define MAX_OBJECT_PER_BATCH_COUNT 10
+#define MAX_BATCH_COUNT 3
+#define MAX_OBJECT_PER_BATCH_COUNT 3
 
 #define ASSIGNMENT_COUNT_BITMASK (~((1u << 16) - 1u))          // = 0xFFFF 0000
 #define SLOT_ID_BITMASK (~(uint32_t)ASSIGNMENT_COUNT_BITMASK)  // = 0x0000 FFFF
@@ -25,11 +25,14 @@ struct SlotMetadata {
           Here, slot ID = (MAX_OBJECT_PER_BATCH_COUNT * batchIndex) + slotIndex
   */
   _Atomic uint32_t bitmap;
+
+  // This slot's ID.
+  uint16_t id;
 };
 
 struct Pool {
-  void*  memory[MAX_BATCH_COUNT];
-  size_t currentBatchCount;
+  void*    memory[MAX_BATCH_COUNT];
+  uint16_t currentBatchCount;
 
   size_t objectSize;
 
@@ -41,34 +44,39 @@ struct Pool {
 };
 
 static void initCurrentBatch(struct Pool* pool) {
-  size_t batchNumber = pool->currentBatchCount - 1;
+  uint16_t batchIndex = pool->currentBatchCount - 1;
 
   // Initialize memory.
-  pool->memory[batchNumber] = malloc(MAX_OBJECT_PER_BATCH_COUNT * pool->objectSize);
+  pool->memory[batchIndex] = malloc(MAX_OBJECT_PER_BATCH_COUNT * pool->objectSize);
 
   // Link each slot with it's previous slot, i.e., it's next allocatable slot.
 
-  char* batchStartsAt = pool->memory[batchNumber];
+  char* batchStartsAt = pool->memory[batchIndex];
 
-  uint32_t firstSlotID = batchNumber * MAX_OBJECT_PER_BATCH_COUNT;
+  uint16_t firstSlotID = batchIndex * MAX_OBJECT_PER_BATCH_COUNT;
 
-  struct SlotMetadata* firstSlotMetadata = (struct SlotMetadata*)batchStartsAt;
-  atomic_store_explicit(&firstSlotMetadata->bitmap, SLOT_ID_BITMASK, memory_order_release);
+  {
+    struct SlotMetadata* firstSlotMetadata = (struct SlotMetadata*)batchStartsAt;
+
+    atomic_store_explicit(&firstSlotMetadata->bitmap, SLOT_ID_BITMASK, memory_order_release);
+    firstSlotMetadata->id = firstSlotID;
+  }
 
   for (int i = 1; i < MAX_OBJECT_PER_BATCH_COUNT; i++) {
+    uint16_t slotID = firstSlotID + i;
+
     struct SlotMetadata* slotMetadata =
         (struct SlotMetadata*)(batchStartsAt + (i * pool->objectSize));
 
-    uint32_t slotID = firstSlotID + i;
-
-    atomic_store_explicit(&slotMetadata->bitmap, slotID - 1, memory_order_release);
+    atomic_store_explicit(&slotMetadata->bitmap, (uint32_t)(slotID - 1), memory_order_release);
+    slotMetadata->id = slotID;
   }
 
   // Update pool->nextAllocatableSlotID;
 
-  uint32_t lastSlotID = firstSlotID + MAX_OBJECT_PER_BATCH_COUNT - 1;
+  uint16_t lastSlotID = firstSlotID + MAX_OBJECT_PER_BATCH_COUNT - 1;
 
-  atomic_store_explicit(&pool->nextAllocatableSlotBitmap, (lastSlotID + (1 << 16)),
+  atomic_store_explicit(&pool->nextAllocatableSlotBitmap, ((uint32_t)lastSlotID + (1 << 16)),
                         memory_order_release);
 }
 
@@ -125,9 +133,9 @@ static void* allocate(struct Pool* pool) {
           // Update nextAllocatableSlotBitmap,
           // with the newly initialized batch's last slot's bitmap.
 
-          uint32_t lastSlotID = (pool->currentBatchCount * MAX_OBJECT_PER_BATCH_COUNT) - 1;
+          uint16_t lastSlotID = (pool->currentBatchCount * MAX_OBJECT_PER_BATCH_COUNT) - 1;
 
-          nextAllocatableSlotBitmap = lastSlotID + (1u << 16);
+          nextAllocatableSlotBitmap = (uint32_t)lastSlotID + (1u << 16);
         }
       }
 
@@ -140,10 +148,9 @@ static void* allocate(struct Pool* pool) {
     }
 
     // It might happen, that, from the batch that thread B just initialized, thread A immediately
-    // uses one or more some slots.
-    // That batch can even get exhausted immediately, before thread B gets to use any slot from
-    // there.
-    // Considering these situations, we have the while loop.
+    // uses one or more some slots. That batch can even get exhausted immediately, before thread B
+    // gets to use any slot from there.
+    // That's why we have the while loop.
 
     /*
       There is another caveat. Suppose, the current batch look's like :
@@ -169,12 +176,12 @@ static void* allocate(struct Pool* pool) {
       since S1's bitmap has changed.
     */
 
-    uint32_t nextAllocatableSlotID = nextAllocatableSlotBitmap & SLOT_ID_BITMASK;
+    uint16_t nextAllocatableSlotID = nextAllocatableSlotBitmap & SLOT_ID_BITMASK;
 
-    uint32_t batchIndex    = nextAllocatableSlotID / MAX_OBJECT_PER_BATCH_COUNT;
+    uint16_t batchIndex    = nextAllocatableSlotID / MAX_OBJECT_PER_BATCH_COUNT;
     char*    batchStartsAt = pool->memory[batchIndex];
 
-    uint32_t nextAllocatableSlotIndex = nextAllocatableSlotID % MAX_OBJECT_PER_BATCH_COUNT;
+    uint16_t nextAllocatableSlotIndex = nextAllocatableSlotID % MAX_OBJECT_PER_BATCH_COUNT;
 
     char* nextAllocatableSlotStartsAt =
         batchStartsAt + (nextAllocatableSlotIndex * pool->objectSize);
@@ -187,7 +194,8 @@ static void* allocate(struct Pool* pool) {
 
     secondNextAllocatableSlotBitmap += (1u << 16);  // Incrementing the assignment count.
 
-    bool allocated = atomic_compare_exchange_strong_explicit(
+    bool allocated = atomic_compare_exchange_weak_explicit(  // We use the weaker version,
+                                                             // since we're in a loop.
         &pool->nextAllocatableSlotBitmap,
 
         &nextAllocatableSlotBitmap, secondNextAllocatableSlotBitmap,
@@ -201,14 +209,32 @@ static void* allocate(struct Pool* pool) {
   }
 }
 
-// static void deallocate(struct Pool* pool, void* object) {
-//   pthread_mutex_lock(&pool->mutexLock);
-//
-//   ((struct SlotMetadata*)object)->nextAllocatableSlotID = pool->nextAllocatableSlot;
-//   pool->nextAllocatableSlotID                           = object;
-//
-//   pthread_mutex_unlock(&pool->mutexLock);
-// }
+// BUG : We don't update the next allocatable slot's ID in the object's bitmap.
+static void deallocate(struct Pool* pool, void* object) {
+  struct SlotMetadata* slotMetadata = (struct SlotMetadata*)object;
+
+  uint32_t currentNextAllocatableSlotBitmap =
+      atomic_load_explicit(&pool->nextAllocatableSlotBitmap, memory_order_acquire);
+  //
+  // Once we acquire the value of pool->nextAllocatableSlotBitmap, it might happen, that some other
+  // thread deallocates, before this thread can.
+  // Thats'y we have the while loop.
+
+  uint32_t newNextAllocatableSlotBitmap =
+      (uint32_t)slotMetadata->id | ((slotMetadata->bitmap & SLOT_ID_BITMASK) + (1u << 16));
+
+  while (true) {
+    bool deallocated = atomic_compare_exchange_weak_explicit(
+        &pool->nextAllocatableSlotBitmap,
+
+        &currentNextAllocatableSlotBitmap, newNextAllocatableSlotBitmap,
+
+        memory_order_acq_rel, memory_order_acquire);
+
+    if (deallocated)
+      break;
+  }
+}
 
 struct Entity {
   struct SlotMetadata slotMetadata;
@@ -222,25 +248,30 @@ void test_singleThreaded( ) {
 
   struct Entity* entities[MAX_BATCH_COUNT * MAX_OBJECT_PER_BATCH_COUNT];
 
-  for (int i = 0; i < MAX_BATCH_COUNT; i++)
-    for (int i = 0; i < MAX_OBJECT_PER_BATCH_COUNT; i++) {
+  for (int b = 0; b < MAX_BATCH_COUNT; b++)
+    for (int s = 0; s < MAX_OBJECT_PER_BATCH_COUNT; s++) {
+      uint16_t slotID = (b * MAX_OBJECT_PER_BATCH_COUNT) + s;
+
       struct Entity* entity = (struct Entity*)allocate(&memoryPool);
       assert(entity != NULL);
 
-      entities[i] = entity;
+      entities[slotID] = entity;
     }
 
   // All slots in all batches have been allocated.
   // If we request further allocations, we should get back NULL.
   assert(allocate(&memoryPool) == NULL);
 
-  // for (int i = 0; i < MAX_BATCH_COUNT; i++)
-  //   for (int i = 0; i < MAX_OBJECT_PER_BATCH_COUNT; i++)
-  //     deallocate(&memoryPool, entities[i]);
-  //
-  // // All slots in all batches have been deallocated.
-  // // A slot should be allocated, if we request an allocation.
-  // assert(allocate(&memoryPool) != NULL);
+  for (int b = 0; b < MAX_BATCH_COUNT; b++)
+    for (int s = 0; s < MAX_OBJECT_PER_BATCH_COUNT; s++) {
+      uint16_t slotID = (b * MAX_OBJECT_PER_BATCH_COUNT) + s;
+
+      deallocate(&memoryPool, entities[slotID]);
+    }
+
+  // All slots in all batches have been deallocated.
+  // A slot should be allocated, if we request an allocation.
+  assert(allocate(&memoryPool) != NULL);
 }
 
 static void* threadWorker(void* args) {
