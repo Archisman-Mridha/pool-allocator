@@ -11,8 +11,20 @@
 #define MAX_BATCH_COUNT 5
 #define MAX_OBJECT_PER_BATCH_COUNT 10
 
+#define ASSIGNMENT_COUNT_BITMASK (~((1u << 16) - 1u))          // = 0xFFFF 0000
+#define SLOT_ID_BITMASK (~(uint32_t)ASSIGNMENT_COUNT_BITMASK)  // = 0x0000 FFFF
+
 struct SlotMetadata {
-  _Atomic uint32_t nextAllocatableSlotID;
+  /*
+    The bitmap is composed of 2 halves :
+
+      (1) The 1st half is a tracker named 'assignment count'. We increment it, everytime this slot
+          becomes the pool's next allocatable slot.
+
+      (2) The 2nd half indicates the next allocatable slot's ID.
+          Here, slot ID = (MAX_OBJECT_PER_BATCH_COUNT * batchIndex) + slotIndex
+  */
+  _Atomic uint32_t bitmap;
 };
 
 struct Pool {
@@ -21,7 +33,9 @@ struct Pool {
 
   size_t objectSize;
 
-  _Atomic uint32_t nextAllocatableSlotID;
+  // When this bitmap's 2nd half, i.e., the next allocatable slot's ID = UINT16_MAX,
+  // it means that there are no more allocatable slots remaining in the current batch.
+  _Atomic uint32_t nextAllocatableSlotBitmap;
 
   pthread_mutex_t batchInitializationMutex;
 };
@@ -38,8 +52,8 @@ static void initCurrentBatch(struct Pool* pool) {
 
   uint32_t firstSlotID = batchNumber * MAX_OBJECT_PER_BATCH_COUNT;
 
-  struct SlotMetadata* firstSlotMetadata   = (struct SlotMetadata*)batchStartsAt;
-  firstSlotMetadata->nextAllocatableSlotID = UINT32_MAX;
+  struct SlotMetadata* firstSlotMetadata = (struct SlotMetadata*)batchStartsAt;
+  atomic_store_explicit(&firstSlotMetadata->bitmap, SLOT_ID_BITMASK, memory_order_release);
 
   for (int i = 1; i < MAX_OBJECT_PER_BATCH_COUNT; i++) {
     struct SlotMetadata* slotMetadata =
@@ -47,14 +61,15 @@ static void initCurrentBatch(struct Pool* pool) {
 
     uint32_t slotID = firstSlotID + i;
 
-    atomic_store_explicit(&slotMetadata->nextAllocatableSlotID, slotID - 1, memory_order_release);
+    atomic_store_explicit(&slotMetadata->bitmap, slotID - 1, memory_order_release);
   }
 
   // Update pool->nextAllocatableSlotID;
 
   uint32_t lastSlotID = firstSlotID + MAX_OBJECT_PER_BATCH_COUNT - 1;
 
-  atomic_store_explicit(&pool->nextAllocatableSlotID, lastSlotID, memory_order_release);
+  atomic_store_explicit(&pool->nextAllocatableSlotBitmap, (lastSlotID + (1 << 16)),
+                        memory_order_release);
 }
 
 static void init(struct Pool* pool, size_t objectSize) {
@@ -62,19 +77,20 @@ static void init(struct Pool* pool, size_t objectSize) {
 
   pool->currentBatchCount = 0;
 
-  atomic_store_explicit(&pool->nextAllocatableSlotID, UINT32_MAX, memory_order_release);
+  atomic_store_explicit(&pool->nextAllocatableSlotBitmap, SLOT_ID_BITMASK, memory_order_release);
 
   pthread_mutex_init(&pool->batchInitializationMutex, NULL);
 }
 
 static void* allocate(struct Pool* pool) {
-  uint32_t nextAllocatableSlotID =
-      atomic_load_explicit(&pool->nextAllocatableSlotID, memory_order_acquire);
+  uint32_t nextAllocatableSlotBitmap =
+      atomic_load_explicit(&pool->nextAllocatableSlotBitmap, memory_order_acquire);
 
   while (true) {
-    // When we've exhausted the current batch,
-    // we can initialize a new batch, if remaining.
-    if (nextAllocatableSlotID == UINT32_MAX) {
+    // When the next allocatable slotID = UINT16_MAX,
+    // we've exhausted the current batch, and,
+    // need to initialize a new batch, if remaining.
+    if ((nextAllocatableSlotBitmap & SLOT_ID_BITMASK) == SLOT_ID_BITMASK) {
       bool allBatchesExhausted = false;
 
       pthread_mutex_lock(&pool->batchInitializationMutex);
@@ -92,10 +108,10 @@ static void* allocate(struct Pool* pool) {
                statement, for optimization puposes 😉.
       */
 
-      nextAllocatableSlotID =
-          atomic_load_explicit(&pool->nextAllocatableSlotID, memory_order_acquire);
+      nextAllocatableSlotBitmap =
+          atomic_load_explicit(&pool->nextAllocatableSlotBitmap, memory_order_acquire);
 
-      if (nextAllocatableSlotID == UINT32_MAX) {
+      if ((nextAllocatableSlotBitmap & SLOT_ID_BITMASK) == SLOT_ID_BITMASK) {
         // All batches have been exhausted.
         if (pool->currentBatchCount >= MAX_BATCH_COUNT)
           allBatchesExhausted = true;
@@ -106,9 +122,12 @@ static void* allocate(struct Pool* pool) {
           ++pool->currentBatchCount;
           initCurrentBatch(pool);
 
-          // Update nextAllocatableSlotID,
-          // with the newly initialized batch's last slot's ID.
-          nextAllocatableSlotID = (pool->currentBatchCount * MAX_OBJECT_PER_BATCH_COUNT) - 1;
+          // Update nextAllocatableSlotBitmap,
+          // with the newly initialized batch's last slot's bitmap.
+
+          uint32_t lastSlotID = (pool->currentBatchCount * MAX_OBJECT_PER_BATCH_COUNT) - 1;
+
+          nextAllocatableSlotBitmap = lastSlotID + (1u << 16);
         }
       }
 
@@ -126,8 +145,34 @@ static void* allocate(struct Pool* pool) {
     // there.
     // Considering these situations, we have the while loop.
 
-    uint32_t batchNumber   = nextAllocatableSlotID / MAX_OBJECT_PER_BATCH_COUNT;
-    char*    batchStartsAt = pool->memory[batchNumber];
+    /*
+      There is another caveat. Suppose, the current batch look's like :
+
+                                S0 <- S1
+                                      ^
+                                      |________ pool->nextAllocatableSlotID.
+
+      Before thread B can do anything, thread A uses S1, and then immediately gives up S2 and then
+      S1, making the current batch like so :
+
+                                S0 <- S2 <- S1
+                                            ^
+                                            |________ pool->nextAllocatableSlotID.
+
+      The current batch's view has changed, and so, thread B should start over a iteration of the
+      while loop. But it will not, since atomic_compare_exchange_strong_explicit( ) will succeed
+      if we solely rely on the nextAllocatableSlotID.
+
+      This is why, we shifted to pool->nextAllocatableSlotBitmap. The bitmap's 1st half has this
+      tracker called 'assignment count'. Everytime S1 becomes the pool's next allocatable slot,
+      we increment that assignment count. So, in the above scenario, thread B will start over,
+      since S1's bitmap has changed.
+    */
+
+    uint32_t nextAllocatableSlotID = nextAllocatableSlotBitmap & SLOT_ID_BITMASK;
+
+    uint32_t batchIndex    = nextAllocatableSlotID / MAX_OBJECT_PER_BATCH_COUNT;
+    char*    batchStartsAt = pool->memory[batchIndex];
 
     uint32_t nextAllocatableSlotIndex = nextAllocatableSlotID % MAX_OBJECT_PER_BATCH_COUNT;
 
@@ -137,18 +182,21 @@ static void* allocate(struct Pool* pool) {
     struct SlotMetadata* nextAllocatableSlotMetadata =
         (struct SlotMetadata*)nextAllocatableSlotStartsAt;
 
-    bool allocated = atomic_compare_exchange_strong_explicit(
-        &pool->nextAllocatableSlotID,
+    uint32_t secondNextAllocatableSlotBitmap =
+        atomic_load_explicit(&nextAllocatableSlotMetadata->bitmap, memory_order_acquire);
 
-        &nextAllocatableSlotID,
-        atomic_load_explicit(&nextAllocatableSlotMetadata->nextAllocatableSlotID,
-                             memory_order_acquire),
+    secondNextAllocatableSlotBitmap += (1u << 16);  // Incrementing the assignment count.
+
+    bool allocated = atomic_compare_exchange_strong_explicit(
+        &pool->nextAllocatableSlotBitmap,
+
+        &nextAllocatableSlotBitmap, secondNextAllocatableSlotBitmap,
 
         memory_order_release, memory_order_acquire);
 
     if (allocated)
       return nextAllocatableSlotStartsAt;
-
+    //
     // Otherwise, we start over, in the next itertion of the while loop.
   }
 }
