@@ -23,10 +23,10 @@ struct SlotMetadata {
 
       (2) The 2nd half indicates the next allocatable slot's ID.
 
-      Here, slot ID = (MAX_OBJECT_PER_BATCH_COUNT * batchIndex) + slotIndex.
+    Here, slot ID = (MAX_OBJECT_PER_BATCH_COUNT * batchIndex) + slotIndex.
 
-      The batch and slot indices are easily calculatable from the slotID. That's why we shifted
-      from using actual pointers as links between slots.
+    The batch and slot indices are easily calculatable from the slotID. That's why we shifted
+    from using actual pointers as links between slots.
   */
   _Atomic(uint32_t) bitmap;
 
